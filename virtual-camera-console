@@ -1,0 +1,455 @@
+#!/usr/bin/env python3
+#
+# INIT sudo modprobe v4l2loopback
+#
+# Check video vlc v4l2://{output_dev}
+#
+# sudo modprobe v4l2loopback devices=3 # or use `modprobe -r v4l2loopback` if already started without multiple devices
+#
+# Recommendation: Start first this program, add a background, then start Zoom.
+#
+# XX IDEAS
+# * hflip might flip just the background and leave the webcamera image (abych něco na něm nezakrýval)
+# * threads, main input loop, thread inotifywait to receive commands via file, thread changing cameras
+# * better display (see which devices are active)
+# * Esc to delete line, Up to go up in the command history
+# * map saturation change to a command
+# * ini constants put to argparse
+# * file with a keys to allow quick change (you can put there `a = image_path` and then write 'a' to change there)
+#
+import logging
+import os
+import re
+import shlex
+import tempfile
+from base64 import b64decode
+from itertools import chain
+from pathlib import Path
+from signal import SIGQUIT, SIGINT
+from subprocess import run, Popen, PIPE, getoutput, DEVNULL
+from time import sleep
+
+import requests
+
+__doc__ = ("Resource: URL, data base64, path (or more of them, comma delimited)"
+           "\nCommands:"
+           "\n* resources,"
+           " empty string (to remove text, temporary background or to switch to camera if not text),"
+           " : (to remove text only)"
+           "\n* cam, camera"
+           "\n* :hflip, :vflip, :scale"
+           "\n* :verbose, :quiet, :q"
+           "\n* any text to be displayed"
+           "\n* :fake, :raw,"
+           " :bg [resource] (changing background),"
+           " :b [resource] (changing background temporarily, until Enter)"
+           "\n")
+
+dev_camera = "/dev/video0"  # input camera
+dev_camera_correction = "/dev/video4"  # XXX used only if hardcoded SATURATE=True yet
+dev_fake_py_output = "/dev/video2"  # input used when fake.py is used
+dev_output = "/dev/video3"
+webp2gif_executable = "/opt/webp2gif"  # may be set to None if not installed (works without it)
+fake_camera_executable = "/opt/Linux-Fake-Background-Webcam/fakecam/fake.py"
+bodypix_executable = "/opt/Linux-Fake-Background-Webcam/bodypix/app.js"
+bodypix_service_uri = "http://rpki-chronicle.csirt.cz:9000"  # if used, `bodypix_executable` will not be used
+bodypix_service_uri = None
+DEFAULT_FONT_SIZE = 100
+
+temp_dir = Path("/tmp/ram")
+tempfile.tempdir = str(temp_dir)
+
+# When output is being captured (in Zoom) and we change the video size (ex: by not scaling streamed JPG image),
+# it looks awfully or totally invisible or Zoom may crash.
+video_scale = "1280", "720"  # str, str
+
+logger = logging.getLogger(__name__)
+
+# SATURATE = True
+SATURATE = False
+if SATURATE:
+    output_format = "-f v4l2 -pix_fmt yuv420p"
+    cmd = f"ffmpeg -i {dev_camera} -vf eq=brightness=0.06:saturation=3 {output_format} {dev_camera_correction}"
+    print("*** Run:", cmd)
+    output_pipe = None if logger.level <= logging.DEBUG else DEVNULL
+    correction = Popen(shlex.split(cmd), shell=False, stdin=PIPE, stdout=DEVNULL, stderr=DEVNULL)
+    dev_camera = dev_camera_correction
+
+
+class Recipe:
+    """ ffmpeg recipe """
+    VIDEO = "video"
+    IMAGE = "image"
+    GIF = "gif"
+    CAMERA = "camera"
+    TEXT = "text"
+
+    @staticmethod
+    def get(path=None, mimetype=None):
+        if mimetype:
+            suffix = mimetype.split("/")[1]
+        elif path.suffix:
+            suffix = path.suffix[1:].lower()
+        else:
+            suffix = getoutput("mimetype " + str(path)).split(" ")[1].split("/")[1]
+        if suffix in ("mp4", "mov", "mpg"):  # XX mpg seems not to work
+            return Recipe.VIDEO
+        elif suffix in ("jpg", "jpeg", "png"):
+            return Recipe.IMAGE
+        elif suffix == "gif":
+            return Recipe.GIF
+        else:
+            return None
+
+
+last_line = ""
+
+
+def reprintable(*s):
+    global last_line
+    s = " ".join(s)
+    last_line = s
+    print(s)
+
+
+def reprint(s, append=False):
+    global last_line
+    print(f"\033[A{' ' * len(last_line)}\033[A")
+    if append:
+        last_line = s = last_line + s
+
+    print(s)
+
+
+class Controller:
+
+    def __init__(self):
+        self.process: Popen = None
+        self.fake_py_process: Popen = None
+        self.bodypix_process: Popen = None
+        # should not have a suffix, when using multiple files,
+        # converting them to a *.gif would fail because `convert` would take the suffix instead of the default .gif
+        self.temp_file = Path(temp_dir, "fakecam-studio-input")
+        self.background_file = Path(temp_dir, "fakecam-studio-background")
+        self.background_base_file = Path(temp_dir, "fakecam-studio-base-background")
+        self.temporary_background_file = Path(temp_dir, "fakecam-studio-temporary-background")
+        self.temporary_background_file_used = False
+        self.text = None
+        self.fontsize = None
+        self.vflip = False
+        self.hflip = False  # if you see it wrong in zoom, you are seen the right way
+        self.image_scale = False
+        self.dev_input = dev_camera
+        logger.setLevel(logging.WARNING)
+        try:
+            # self.start_fake()
+            self.run()
+        except KeyboardInterrupt:
+            print("Exit")
+        finally:
+            self.stop_fake()
+            self.clean_up([self.process, self.fake_py_process, self.bodypix_process])
+
+    def start_fake(self):
+        if not self.background_file.exists():
+            print("Cannot start fake.py, no background image. Change it first with `:bg URI`")
+            return
+        self.clean_up()
+        reprintable("Starting fake.py camera...")
+        p = Path(fake_camera_executable)
+        args = {"stdout": DEVNULL, "stderr": DEVNULL}
+        cmds = ["./" + p.name,
+                "--webcam-path", dev_camera,
+                "--v4l2loopback-path", dev_fake_py_output,
+                "--image-folder", str(self.background_file.parent),
+                "--background-image", self.background_file.name,
+                # "-f", "foreground-macciaveli.png",
+                # "-m", "foreground-mask.png",
+                "--no-foreground"
+                # "--bodypix-url", "rpki-chronicle.csirt.cz:9000"
+                # "--hologram"
+                ]
+        if bodypix_service_uri:
+            cmds.extend(["--bodypix-url", bodypix_service_uri])
+        self.fake_py_process = Popen(cmds, cwd=str(p.parent), **args)  # X "--hologram"
+        #   -f FOREGROUND_IMAGE, --foreground-image FOREGROUND_IMAGE
+        #                         Foreground image path
+        #   -m FOREGROUND_MASK_IMAGE, --foreground-mask-image FOREGROUND_MASK_IMAGE
+        #                         Foreground mask image path
+
+
+        if not bodypix_service_uri:
+            b = Path(bodypix_executable)
+            self.bodypix_process = Popen(["node", b.name], cwd=str(b.parent), **args)
+        reprint(" has 3 seconds to start...", True)
+        sleep(3)
+        reprint(" Done", True)
+        self.dev_input = dev_fake_py_output
+
+    def refresh_fake_background(self, uri):
+        if not uri:
+            self.stop_fake()
+        else:
+            print(f"Refreshed background file to {uri}")
+            self.parse_query(uri, self.background_file, always_write=True)
+            if not self.fake_py_process:  # start with self.background_file
+                self.start_fake()
+            else:  # refresh
+                self.fake_py_process.send_signal(SIGINT)
+
+    def stop_fake(self):
+        """ Ending fake.py with a signal """
+        if self.fake_py_process:
+            self.dev_input = dev_camera
+            self.fake_py_process.send_signal(SIGQUIT)
+            if self.bodypix_process:
+                self.bodypix_process.terminate()
+            # When wanting to use camera straight further, we have to wait this process to end.
+            # I do not know why, when using camera, I would have said we can share input_dev
+            self.fake_py_process.wait()
+            if self.bodypix_process:
+                self.bodypix_process.wait()  # if not awaited, the bodypix server would continue to run
+            self.fake_py_process = None
+            print("Stopped fake.py")
+
+    def run_program(self, args):
+        print("* Running:", args)
+        run(args)
+
+    def run(self):
+        current_file = None
+        recipe = Recipe.CAMERA
+        self.launch()  # start with camera by default
+        while True:
+            # Await next user command
+            print("Paste URL(s), path(s), text or command (type ? to get help):")
+            uri = input()
+
+            # debug shortcuts XX
+            if uri == "a":
+                uri = "/tmp/ram/a.jpg"
+            elif uri == "b":
+                uri = "/tmp/ram/b.jpg"
+            elif uri == "c":
+                uri = "/tmp/ram/c.jpg"
+            elif uri == "d":
+                uri = ":bg/tmp/ram/a.jpg"
+            elif uri == "e":
+                uri = ":bg/tmp/ram/b.jpg"
+            elif uri == "f":
+                uri = ":b/tmp/ram/a.jpg"
+            elif uri == "g":
+                uri = ":b/tmp/ram/b.jpg"
+            elif uri == "h":
+                uri = ":b/tmp/ram/c.jpg"
+
+            # process commands
+            if uri.strip() == "?":
+                print(__doc__)
+                continue
+            if uri.startswith(":"):
+                cmd = uri
+                uri = None
+                if cmd == ":":  # just reset text
+                    print("Clearing text")
+                    self.text = None
+                elif cmd == ":vflip":
+                    self.vflip = not self.vflip
+                    print("Vertical flip: ", self.vflip)
+                elif cmd == ":hflip":
+                    self.hflip = not self.hflip
+                    print("Horizontal flip: ", self.hflip)
+                elif cmd == ":verbose":  # turn up/down verbosity and ffmpeg output
+                    logger.setLevel(logging.DEBUG)
+                    print("Verbose mode.")
+                elif cmd == ":quiet":  # turn up/down verbosity and ffmpeg output
+                    logger.setLevel(logging.INFO)
+                    print("Quiet mode.")
+                elif cmd in (":q", ":quit"):  # quit
+                    print("Exit.")
+                    return
+                elif cmd == ":fake":  # turn on fake.py
+                    self.start_fake()
+                elif cmd == ":raw":  # turn off fake.py
+                    self.stop_fake()
+                elif cmd.startswith(":bg"):  # turn on or refresh fake.py
+                    uri_ = re.search(r":bg\s?(.*)", cmd)[1]
+                    if not uri_:
+                        self.background_base_file.unlink()
+                    else:
+                        self.refresh_fake_background(uri_)
+                        self.background_base_file.write_bytes(self.background_file.read_bytes())
+                elif cmd.startswith(":b"):  # turn on or refresh fake.py - temporary background, cancellable by "enter"
+                    uri_ = re.search(r":b\s?(.*)", cmd)[1]
+                    self.refresh_fake_background(uri_)
+                elif cmd == ":scale":
+                    self.image_scale = not self.image_scale
+                    if m := re.search(r":bg\s?(.*)", uri):
+                        uri = m[1]
+                else:
+                    print("** Unknown command **")
+
+            if uri is not None:
+                current_file, recipe, self.text, self.fontsize = self.parse_query(uri, self.temp_file,
+                                                                                  current_file, recipe, self.text)
+
+            if not recipe:
+                print("Cannot tell what to do with that file type")
+                continue
+
+            scaled_filter = (f"[1:v]scale='min({video_scale[0]},iw)':min'({video_scale[1]},ih)'"
+                             f":force_original_aspect_ratio=decrease,"
+                             f"pad={':'.join(video_scale)}:(ow-iw)/2:(oh-ih)/2 [ovrl],"
+                             f" [0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+
+            if recipe == Recipe.TEXT:
+                # only text, no more changes
+                self.launch()
+            elif recipe == Recipe.IMAGE:
+                if self.image_scale:
+                    self.launch(source=f"-i {current_file}", filtering=scaled_filter)
+                else:
+                    self.launch(source=f"-i {current_file}",
+                                filtering=f"[1:v]scale={':'.join(video_scale)} [ovrl],"
+                                          "[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+            elif recipe == Recipe.CAMERA:
+                self.launch()
+            elif recipe == Recipe.GIF:
+                # gif needs ignore_loop flag se that we can set the animation loops            
+                self.launch(source=f"-ignore_loop 0 -i {current_file}",
+                            filtering=f"[1:v]loop=-1, scale={':'.join(video_scale)} [ovrl],"
+                                      f"[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+            elif recipe == Recipe.VIDEO:
+                # if not streamed with the original video, fps were too high                
+                self.launch(source=f"-i {current_file}",
+                            filtering=scaled_filter)
+
+            sleep(1.2)  # move output from ffmpeg above this process output menu
+
+    def parse_query(self, full_uri, temp_file, current_file="", recipe=None, text=None, always_write=False):
+        # process URL, path or text
+        fontsize = DEFAULT_FONT_SIZE
+        uris = full_uri.strip().split(" ")
+        first = uris[0]
+        if full_uri == "cam" or full_uri == "camera":  # just switch to camera
+            print("Restoring camera")
+            recipe = Recipe.CAMERA
+        elif not full_uri.strip():
+            # empty command: reset text, restore base background and change to camera (if no text)
+            if self.background_base_file.exists():
+                print("Restoring default background")
+                self.refresh_fake_background(str(self.background_base_file))
+            if not text and recipe is not Recipe.CAMERA:
+                print("Restoring camera (no text found)")
+                recipe = Recipe.CAMERA
+            text = None
+        elif not (first.startswith("data:") or first.startswith(("http:", "https:", "//")) or Path(first).exists()):
+            # this is just a text to be displayed
+            text = full_uri.replace(r"\n", "\n").replace("\t", "\n")  # XX might be quoting
+            if text.startswith("*"):
+                fontsize = 200
+                text = text[len("*"):]
+            if not recipe or recipe == Recipe.CAMERA:
+                recipe = Recipe.TEXT
+        else:  # URL, base64 or static file
+            if len(uris) == 1:
+                current_file, recipe = self._prepare_file(temp_file, uris[0], always_write=always_write)
+            else:
+                # XX Not works very well on background, works better on foreground
+                # resources = [self._prepare_file(Path(tempfile.NamedTemporaryFile().name), uri)[0] for uri in uris]
+                # size = "275x183"  # "128x72"
+                # resources = [("-delay", "100", "-resize", size, self._prepare_file(Path(tempfile.NamedTemporaryFile(suffix=".jpg").name), uri)[0]) for uri in uris]
+                resources = [("-delay", "100", self._prepare_file(Path(tempfile.NamedTemporaryFile().name), uri)[0]) for uri in uris]
+                gif_output = Path(temp_dir, "convert-temp.gif")
+                # self.run_program(["convert", *chain(*resources), "-resample", 'x'.join(str(round(int(i)/10)) for i in video_scale), gif_output])
+                cmd = ["convert", *chain(*resources), gif_output]
+                print(*cmd)
+                self.run_program(cmd)
+                gif_output.rename(temp_file)
+                current_file, recipe = temp_file, Recipe.GIF
+        return current_file, recipe, text, fontsize
+
+    def _prepare_file(self, temp_file, uri, always_write=False):
+        current_file = recipe = None
+        if uri.startswith("data:"):
+            if m := re.search("data:(.*?);base64,(.*)", uri):
+                mimetype, img_string = m.groups()
+                temp_file.write_bytes(b64decode(img_string))
+                current_file = temp_file
+                recipe = Recipe.get(temp_file, mimetype=mimetype)
+            else:
+                print("Failed unpacking BASE64 data")
+        elif uri.startswith(("http:", "https:", "//")):
+            print("Downloading", uri)
+            if "giphy.com" in uri and "giphy.webp" in uri:
+                # ex: test https://media3.giphy.com/media/WONVuAsE0opm8/giphy.webp?cid=ecf05e47ls1ujnntyxgx35hlovp7tq0409zkhdlyv61w903m&rid=giphy.webp
+                response = requests.get(uri.replace("giphy.webp", "giphy.gif"))
+            elif "giphy.com" in uri and ".webp" in uri:
+                # when using giphy.com, try fetch better source
+                # ex: https://media1.giphy.com/media/Ov5NiLVXT8JEc/200w.gif?cid=ecf05...
+                url, resolution, suffix = re.search("(.*?/media/.*?/)(\d+)(.*)\?", uri).groups()
+                better_suffix = suffix.replace(".webp", ".gif")
+                better_resolution = str(int(resolution) * 2)
+                urls = [(url, better_resolution, better_suffix),
+                        (url, resolution, better_suffix),
+                        (url, better_resolution, suffix),
+                        (url, resolution, suffix)]
+                for u in ("".join(u) for u in urls):
+                    print("Changed to", u)
+                    response = requests.get(u)
+                    if response.status_code == 200:
+                        break
+                else:
+                    return None, None
+            else:
+                response = requests.get(uri)
+            temp_file.write_bytes(response.content)
+            current_file = temp_file
+
+            if response.headers['content-type'] == "image/webp" and webp2gif_executable:  # does not work very well
+                cwd = os.getcwd()
+                os.chdir(temp_file.parent)
+                self.run_program([webp2gif_executable, temp_file, temp_file.name])
+                os.chdir(cwd)
+                recipe = Recipe.GIF
+            else:
+                recipe = Recipe.get(mimetype=response.headers['content-type'])
+        else:
+            current_file = Path(uri)
+            if always_write:
+                temp_file.write_bytes(current_file.read_bytes())
+                current_file = temp_file
+            recipe = Recipe.get(current_file)
+        return current_file, recipe
+
+    def launch(self, source="", filtering=""):
+        self.clean_up()
+
+        text_cmd = (f"drawtext=fontfile=/path/to/font.ttf: "
+                    f"text='{self.text}': fontcolor=white: fontsize={self.fontsize}: box=1: boxcolor=black@0.5: "
+                    f"boxborderw=5: x=(w-text_w)/2: y=(h-text_h)/2") if self.text else ""
+        filter_complex = [filtering,
+                          text_cmd,
+                          self.vflip and "vflip",
+                          self.hflip and "hflip"]
+        output_format = "-f v4l2 -pix_fmt yuv420p"
+
+        filter_cmd = '-filter_complex "' + ",".join(f for f in filter_complex if f) + '"' if any(filter_complex) else ""
+        cmd = f"ffmpeg -i {self.dev_input} {source} {filter_cmd} {output_format} {dev_output}"
+        print("*** Run:", cmd)
+        output_pipe = None if logger.level <= logging.DEBUG else DEVNULL
+        self.process = Popen(shlex.split(cmd), shell=False, stdin=PIPE, stdout=output_pipe, stderr=output_pipe)
+
+    def clean_up(self, processes=None):
+        if not processes:
+            processes = [self.process]
+
+        # Ending processes with terminate and wait
+        [p.terminate() for p in processes if p]
+        [p.wait() for p in processes if p]
+
+
+if __name__ == "__main__":
+    # Disable canonical mode, otherwise the input() took 4095 chars only (short for base64 input)
+    run("stty -icanon", shell=True)
+    Controller()
