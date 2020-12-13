@@ -25,8 +25,10 @@ import tempfile
 from base64 import b64decode
 from itertools import chain
 from pathlib import Path
+from queue import Queue
 from signal import SIGQUIT, SIGINT
 from subprocess import run, Popen, PIPE, getoutput, DEVNULL
+from threading import Thread
 from time import sleep
 
 import requests
@@ -44,6 +46,8 @@ __doc__ = ("Resource: URL, data base64, path (or more of them, comma delimited)"
            " :bg [resource] (changing background),"
            " :b [resource] (changing background temporarily, until Enter)"
            "\n")
+
+from inotify_simple import INotify, flags
 
 dev_camera = "/dev/video0"  # input camera
 dev_camera_correction = "/dev/video4"  # XXX used only if hardcoded SATURATE=True yet
@@ -134,6 +138,7 @@ class Controller:
         self.background_base_file = Path(temp_dir, "fakecam-studio-base-background")
         self.temporary_background_file = Path(temp_dir, "fakecam-studio-temporary-background")
         self.temporary_background_file_used = False
+        self.command_file = Path(temp_dir, "command_listener")  # whatever is written here is taken for a command
         self.text = None
         self.fontsize = None
         self.vflip = False
@@ -141,14 +146,34 @@ class Controller:
         self.image_scale = False
         self.dev_input = dev_camera
         logger.setLevel(logging.WARNING)
+
+        # in the main loop we listen for the commands
+        # file_watcher
+        queue = Queue() # XXX pro zajímavost, musí se to předávat arugmentem?
+        listener = Thread(target=self.run, args=(queue,))  # this is the worker that parses the commands
+        file_watcher = Thread(target=self.file_watcher, args=(queue,))  # commands may be piped in through a file change
+        listener.start()
+        file_watcher.start()  # XXX will be clean up when programs ends?
         try:
-            # self.start_fake()
-            self.run()
+            while True:
+                print("Paste URL(s), path(s), text or command (type ? to get help):")
+                queue.put(input())
         except KeyboardInterrupt:
-            print("Exit")
+            queue.put(":quit")
         finally:
             self.stop_fake()
             self.clean_up([self.process, self.fake_py_process, self.bodypix_process])
+
+    def file_watcher(self, queue: Queue):
+        if not self.command_file.exists():
+            self.command_file.touch()
+        inotify = INotify()
+        watch_flags = flags.CREATE | flags.DELETE | flags.MODIFY | flags.DELETE_SELF
+        inotify.add_watch(self.command_file, watch_flags)
+        while inotify.read():
+            cmd = self.command_file.read_text().strip()
+            print("Command file command:", cmd)
+            queue.put(cmd)
 
     def start_fake(self):
         if not self.background_file.exists():
@@ -176,7 +201,6 @@ class Controller:
         #                         Foreground image path
         #   -m FOREGROUND_MASK_IMAGE, --foreground-mask-image FOREGROUND_MASK_IMAGE
         #                         Foreground mask image path
-
 
         if not bodypix_service_uri:
             b = Path(bodypix_executable)
@@ -216,14 +240,13 @@ class Controller:
         print("* Running:", args)
         run(args)
 
-    def run(self):
+    def run(self, queue: Queue):
         current_file = None
         recipe = Recipe.CAMERA
         self.launch()  # start with camera by default
         while True:
             # Await next user command
-            print("Paste URL(s), path(s), text or command (type ? to get help):")
-            uri = input()
+            uri = queue.get().strip()
 
             # debug shortcuts XX
             if uri == "a":
@@ -359,7 +382,8 @@ class Controller:
                 # resources = [self._prepare_file(Path(tempfile.NamedTemporaryFile().name), uri)[0] for uri in uris]
                 # size = "275x183"  # "128x72"
                 # resources = [("-delay", "100", "-resize", size, self._prepare_file(Path(tempfile.NamedTemporaryFile(suffix=".jpg").name), uri)[0]) for uri in uris]
-                resources = [("-delay", "100", self._prepare_file(Path(tempfile.NamedTemporaryFile().name), uri)[0]) for uri in uris]
+                resources = [("-delay", "100", self._prepare_file(Path(tempfile.NamedTemporaryFile().name), uri)[0]) for
+                             uri in uris]
                 gif_output = Path(temp_dir, "convert-temp.gif")
                 # self.run_program(["convert", *chain(*resources), "-resample", 'x'.join(str(round(int(i)/10)) for i in video_scale), gif_output])
                 cmd = ["convert", *chain(*resources), gif_output]
