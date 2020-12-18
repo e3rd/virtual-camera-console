@@ -8,6 +8,7 @@
 # * ini constants put to argparse
 # * see desktop
 # * beginning: check that fake.py nor ffmpeg processes are running (in the end when I hit Ctrl+C twice, it will not get ended properly)
+# * allow space in a file name
 #
 import binascii
 import logging
@@ -32,7 +33,7 @@ import requests
 __doc__ = ("Resource: URL, data base64, path (or more of them, comma delimited)"
            "\nCommands:"
            "\n* resources,"
-           " empty string (to remove text, temporary background or to switch to camera if not text),"
+           " empty string (respectively remove text, switch to camera, remove temporary background),"
            " : (to remove text only)"
            "\n* cam, camera"
            "\n* :hflip, :vflip, :scale"
@@ -344,8 +345,8 @@ class Controller:
                         else:
                             self.refresh_fake_background(uri_)
                             self.background_base_file.write_bytes(self.background_file.read_bytes())
-                    elif cmd.startswith(
-                            ":b"):  # turn on or refresh fake.py - temporary background, cancellable by "enter"
+                    elif cmd.startswith(":b"):
+                        # turn on or refresh fake.py - temporary background, cancellable by "enter"
                         uri_ = re.search(r":b\s?(.*)", cmd)[1]
                         self.refresh_fake_background(uri_)
                     elif cmd == ":scale":
@@ -405,14 +406,15 @@ class Controller:
             print("Restoring camera")
             recipe = Recipe.CAMERA
         elif not full_uri.strip():
-            # empty command: reset text, restore base background and change to camera (if no text)
-            if self.background_base_file.exists():
-                print("Restoring default background")
-                self.refresh_fake_background(str(self.background_base_file))
-            if not text and recipe is not Recipe.CAMERA:
+            # empty command (respectively): reset text, change to camera and restore base background
+            if text:
+                text = None
+            elif recipe is not Recipe.CAMERA:
                 print("Restoring camera (no text found)")
                 recipe = Recipe.CAMERA
-            text = None
+            elif self.background_base_file.exists():
+                print("Restoring default background")
+                self.refresh_fake_background(str(self.background_base_file))
         elif first.startswith("data:") or first.startswith(("http:", "https:", "//")) or Path(first).exists():
             # URL, base64 or static file
             if len(uris) == 1:
