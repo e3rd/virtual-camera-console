@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 #
-# INIT sudo modprobe v4l2loopback
-#
-# Check video vlc v4l2://{output_dev}
-#
-# sudo modprobe v4l2loopback devices=3 # or use `modprobe -r v4l2loopback` if already started without multiple devices
-#
-# Recommendation: Start first this program, add a background, then start Zoom.
-#
 # XX IDEAS
 # * hflip might flip just the background and leave the webcamera image (abych něco na něm nezakrýval)
-# * threads, main input loop, thread inotifywait to receive commands via file, thread changing cameras
 # * better display (see which devices are active)
 # * Esc to delete line, Up to go up in the command history
 # * map saturation change to a command
@@ -34,6 +25,7 @@ from signal import SIGQUIT, SIGINT
 from subprocess import run, Popen, PIPE, getoutput, DEVNULL, STDOUT
 from threading import Thread
 from time import sleep
+from typing import Optional
 
 import requests
 
@@ -139,9 +131,9 @@ def shorten(s, maxlen=200):
 class Controller:
 
     def __init__(self):
-        self.process: Popen = None
-        self.fake_py_process: Popen = None
-        self.bodypix_process: Popen = None
+        self.process: Optional[Popen] = None
+        self.fake_py_process: Optional[Popen] = None
+        self.bodypix_process: Optional[Popen] = None
         # should not have a suffix, when using multiple files,
         # converting them to a *.gif would fail because `convert` would take the suffix instead of the default .gif
         self.temp_file = Path(temp_dir, "fakecam-studio-input")
@@ -160,11 +152,11 @@ class Controller:
 
         # in the main loop we listen for the commands
         # file_watcher
-        queue = Queue()  # XXX pro zajímavost, musí se to předávat arugmentem?
+        queue = Queue()
         listener = Thread(target=self.run, args=(queue,))  # this is the worker that parses the commands
         file_watcher = Thread(target=self.file_watcher, args=(queue,))  # commands may be piped in through a file change
         listener.start()
-        file_watcher.start()  # XXX will be clean up when programs ends?
+        file_watcher.start()
         try:
             while True:
                 print()
@@ -201,21 +193,9 @@ class Controller:
             if cmd == "":
                 continue
             print("Command fetched from file:", cmd, "\n")
-            print("***!!!!!!!! XXX PUSHING CMD")
-            Path("/tmp/ram/hej1").write_text(cmd)
-            Path("/tmp/ram/hej2").write_text(cmd.strip())
-            c = cmd.strip()
-            print("LEN PUT", len(c))
-            queue.put(c)
+            queue.put(cmd.strip())
 
-    def store_last_line(self, process, master_fd, slave_fd):
-        # XXX thread is not ended, how it will clean up?
-        # for line in iter(process.stdout.readline, b""):
-        #     if not line:
-        #         continue
-        #     print("HUU", line)
-        #     TEST_ME.append(line) # XXX does not work
-        #     # process.last_line = line XXX
+    def store_last_line(self, master_fd, slave_fd):
         timeout = .04  # seconds
         while True:
             ready, _, _ = select.select([master_fd], [], [], timeout)
@@ -292,7 +272,8 @@ class Controller:
             self.fake_py_process = None
             print("Stopped fake.py")
 
-    def run_program(self, args):
+    @staticmethod
+    def run_program(args):
         print("* Running:", args)
         run(args)
 
@@ -349,8 +330,8 @@ class Controller:
                         print("Exit.")
                         return
                     elif cmd == ":vlc":
-                        Popen(["vlc", f"v4l2://{dev_output}"])  # XXX prevent termination on program exit
-                        # Popen(f"vlc v4l2://{dev_output}", shell=True) # XXX.send_signal(SIGHUP)
+                        # preexec_fn prevents termination on program exit
+                        Popen(["vlc", f"v4l2://{dev_output}"], stdout=DEVNULL, stderr=DEVNULL, preexec_fn=os.setpgrp)
                         continue
                     elif cmd == ":fake":  # turn on fake.py
                         self.start_fake()
@@ -538,7 +519,7 @@ class Controller:
         master_fd, slave_fd = pty.openpty()
         self.process = Popen(shlex.split(cmd), shell=False, stdin=PIPE, stdout=slave_fd, stderr=STDOUT)
 
-        t = Thread(target=self.store_last_line, args=(self.process, master_fd, slave_fd))
+        t = Thread(target=self.store_last_line, args=(master_fd, slave_fd))
         # XX Should implement this for other processes too.
         # t.daemon = True <- is that needed? XX
         t.start()
