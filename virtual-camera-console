@@ -15,11 +15,15 @@
 # * Esc to delete line, Up to go up in the command history
 # * map saturation change to a command
 # * ini constants put to argparse
-# * file with a keys to allow quick change (you can put there `a = image_path` and then write 'a' to change there)
+# * see desktop
+# * beginning: check that fake.py nor ffmpeg processes are running (in the end when I hit Ctrl+C twice, it will not get ended properly)
 #
+import binascii
 import logging
 import os
+import pty
 import re
+import select
 import shlex
 import tempfile
 from base64 import b64decode
@@ -27,7 +31,7 @@ from itertools import chain
 from pathlib import Path
 from queue import Queue
 from signal import SIGQUIT, SIGINT
-from subprocess import run, Popen, PIPE, getoutput, DEVNULL
+from subprocess import run, Popen, PIPE, getoutput, DEVNULL, STDOUT
 from threading import Thread
 from time import sleep
 
@@ -41,6 +45,7 @@ __doc__ = ("Resource: URL, data base64, path (or more of them, comma delimited)"
            "\n* cam, camera"
            "\n* :hflip, :vflip, :scale"
            "\n* :verbose, :quiet, :q"
+           "\n* :vlc to see live output"
            "\n* any text to be displayed"
            "\n* :fake, :raw,"
            " :bg [resource] (changing background),"
@@ -125,6 +130,12 @@ def reprint(s, append=False):
     print(s)
 
 
+def shorten(s, maxlen=200):
+    if len(s) < maxlen:
+        return s
+    return s[:maxlen] + "..."
+
+
 class Controller:
 
     def __init__(self):
@@ -149,18 +160,23 @@ class Controller:
 
         # in the main loop we listen for the commands
         # file_watcher
-        queue = Queue() # XXX pro zajímavost, musí se to předávat arugmentem?
+        queue = Queue()  # XXX pro zajímavost, musí se to předávat arugmentem?
         listener = Thread(target=self.run, args=(queue,))  # this is the worker that parses the commands
         file_watcher = Thread(target=self.file_watcher, args=(queue,))  # commands may be piped in through a file change
         listener.start()
         file_watcher.start()  # XXX will be clean up when programs ends?
         try:
             while True:
+                print()
+                if self.process:
+                    print(f"{self.dev_input}:", getattr(self.process, "last_line", ""))
                 print("Paste URL(s), path(s), text or command (type ? to get help):")
                 queue.put(input())
         except KeyboardInterrupt:
-            queue.put(":quit")
+            pass
         finally:
+            queue.put(":quit")  # stop the listener thread
+            self.command_file.unlink()  # stop the file_watcher thread
             self.stop_fake()
             self.clean_up([self.process, self.fake_py_process, self.bodypix_process])
 
@@ -171,9 +187,49 @@ class Controller:
         watch_flags = flags.CREATE | flags.DELETE | flags.MODIFY | flags.DELETE_SELF
         inotify.add_watch(self.command_file, watch_flags)
         while inotify.read():
-            cmd = self.command_file.read_text().strip()
-            print("Command file command:", cmd)
-            queue.put(cmd)
+            # The sleep is here very important.
+            # Since the data might be longer than a simple URL (like base64 image in data:image/jpeg)
+            # the command `xclip -selection c -o > /tmp/ram/command_listener` might not put it there in an atomic way
+            # Hence we might end up with having a half of a base64 string and decoding fails.
+            # While not fully fool-proof, the simple sleep allows to mitigate the issue effectively.
+            sleep(0.1)
+            try:
+                cmd = self.command_file.read_text()
+            except FileNotFoundError:
+                # file has been deleted -> we should stop the thread
+                return
+            if cmd == "":
+                continue
+            print("Command fetched from file:", cmd, "\n")
+            print("***!!!!!!!! XXX PUSHING CMD")
+            Path("/tmp/ram/hej1").write_text(cmd)
+            Path("/tmp/ram/hej2").write_text(cmd.strip())
+            c = cmd.strip()
+            print("LEN PUT", len(c))
+            queue.put(c)
+
+    def store_last_line(self, process, master_fd, slave_fd):
+        # XXX thread is not ended, how it will clean up?
+        # for line in iter(process.stdout.readline, b""):
+        #     if not line:
+        #         continue
+        #     print("HUU", line)
+        #     TEST_ME.append(line) # XXX does not work
+        #     # process.last_line = line XXX
+        timeout = .04  # seconds
+        while True:
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+            if ready:
+                data = os.read(master_fd, 512)
+                if not data:
+                    break
+                self.process.last_line = data.decode("utf-8").strip()
+            elif self.process.poll() is not None:  # select timeout
+                assert not select.select([master_fd], [], [], 0)[0]  # detect race condition
+                break  # proc exited
+
+        os.close(slave_fd)  # can't do it sooner: it leads to errno.EIO error
+        os.close(master_fd)
 
     def start_fake(self):
         if not self.background_file.exists():
@@ -196,7 +252,7 @@ class Controller:
                 ]
         if bodypix_service_uri:
             cmds.extend(["--bodypix-url", bodypix_service_uri])
-        self.fake_py_process = Popen(cmds, cwd=str(p.parent), **args)  # X "--hologram"
+        self.fake_py_process = Popen(cmds, cwd=str(p.parent), **args)
         #   -f FOREGROUND_IMAGE, --foreground-image FOREGROUND_IMAGE
         #                         Foreground image path
         #   -m FOREGROUND_MASK_IMAGE, --foreground-mask-image FOREGROUND_MASK_IMAGE
@@ -214,7 +270,7 @@ class Controller:
         if not uri:
             self.stop_fake()
         else:
-            print(f"Refreshed background file to {uri}")
+            print(f"Refreshed background file to {shorten(uri)}")
             self.parse_query(uri, self.background_file, always_write=True)
             if not self.fake_py_process:  # start with self.background_file
                 self.start_fake()
@@ -267,92 +323,102 @@ class Controller:
                 uri = ":b/tmp/ram/c.jpg"
 
             # process commands
-            if uri.strip() == "?":
-                print(__doc__)
-                continue
-            if uri.startswith(":"):
-                cmd = uri
-                uri = None
-                if cmd == ":":  # just reset text
-                    print("Clearing text")
-                    self.text = None
-                elif cmd == ":vflip":
-                    self.vflip = not self.vflip
-                    print("Vertical flip: ", self.vflip)
-                elif cmd == ":hflip":
-                    self.hflip = not self.hflip
-                    print("Horizontal flip: ", self.hflip)
-                elif cmd == ":verbose":  # turn up/down verbosity and ffmpeg output
-                    logger.setLevel(logging.DEBUG)
-                    print("Verbose mode.")
-                elif cmd == ":quiet":  # turn up/down verbosity and ffmpeg output
-                    logger.setLevel(logging.INFO)
-                    print("Quiet mode.")
-                elif cmd in (":q", ":quit"):  # quit
-                    print("Exit.")
-                    return
-                elif cmd == ":fake":  # turn on fake.py
-                    self.start_fake()
-                elif cmd == ":raw":  # turn off fake.py
-                    self.stop_fake()
-                elif cmd.startswith(":bg"):  # turn on or refresh fake.py
-                    uri_ = re.search(r":bg\s?(.*)", cmd)[1]
-                    if not uri_:
-                        self.background_base_file.unlink()
-                    else:
+            try:
+                if uri.strip() == "?":
+                    print(__doc__)
+                    continue
+                if uri.startswith(":"):
+                    cmd = uri
+                    uri = None
+                    if cmd == ":":  # just reset text
+                        print("Clearing text")
+                        self.text = None
+                    elif cmd == ":vflip":
+                        self.vflip = not self.vflip
+                        print("Vertical flip: ", self.vflip)
+                    elif cmd == ":hflip":
+                        self.hflip = not self.hflip
+                        print("Horizontal flip: ", self.hflip)
+                    elif cmd == ":verbose":  # turn up/down verbosity and ffmpeg output
+                        logger.setLevel(logging.DEBUG)
+                        print("Verbose mode.")
+                    elif cmd == ":quiet":  # turn up/down verbosity and ffmpeg output
+                        logger.setLevel(logging.INFO)
+                        print("Quiet mode.")
+                    elif cmd in (":q", ":quit"):  # quit
+                        print("Exit.")
+                        return
+                    elif cmd == ":vlc":
+                        Popen(["vlc", f"v4l2://{dev_output}"])  # XXX prevent termination on program exit
+                        # Popen(f"vlc v4l2://{dev_output}", shell=True) # XXX.send_signal(SIGHUP)
+                        continue
+                    elif cmd == ":fake":  # turn on fake.py
+                        self.start_fake()
+                    elif cmd == ":raw":  # turn off fake.py
+                        self.stop_fake()
+                    elif cmd.startswith(":bg"):  # turn on or refresh fake.py
+                        uri_ = re.search(r":bg\s?(.*)", cmd)[1]
+                        if not uri_:
+                            self.background_base_file.unlink()
+                        else:
+                            self.refresh_fake_background(uri_)
+                            self.background_base_file.write_bytes(self.background_file.read_bytes())
+                    elif cmd.startswith(
+                            ":b"):  # turn on or refresh fake.py - temporary background, cancellable by "enter"
+                        uri_ = re.search(r":b\s?(.*)", cmd)[1]
                         self.refresh_fake_background(uri_)
-                        self.background_base_file.write_bytes(self.background_file.read_bytes())
-                elif cmd.startswith(":b"):  # turn on or refresh fake.py - temporary background, cancellable by "enter"
-                    uri_ = re.search(r":b\s?(.*)", cmd)[1]
-                    self.refresh_fake_background(uri_)
-                elif cmd == ":scale":
-                    self.image_scale = not self.image_scale
-                    if m := re.search(r":bg\s?(.*)", uri):
-                        uri = m[1]
-                else:
-                    print("** Unknown command **")
+                    elif cmd == ":scale":
+                        self.image_scale = not self.image_scale
+                        if m := re.search(r":bg\s?(.*)", uri):
+                            uri = m[1]
+                    else:
+                        print("** Unknown command **")
 
-            if uri is not None:
-                current_file, recipe, self.text, self.fontsize = self.parse_query(uri, self.temp_file,
-                                                                                  current_file, recipe, self.text)
+                if uri is not None:
+                    current_file, recipe, self.text, self.fontsize = self.parse_query(uri, self.temp_file,
+                                                                                      current_file, recipe, self.text)
 
-            if not recipe:
-                print("Cannot tell what to do with that file type")
-                continue
+                if not recipe:
+                    print("Cannot tell what to do with that file type")
+                    continue
 
-            scaled_filter = (f"[1:v]scale='min({video_scale[0]},iw)':min'({video_scale[1]},ih)'"
-                             f":force_original_aspect_ratio=decrease,"
-                             f"pad={':'.join(video_scale)}:(ow-iw)/2:(oh-ih)/2 [ovrl],"
-                             f" [0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+                scaled_filter = (f"[1:v]scale='min({video_scale[0]},iw)':min'({video_scale[1]},ih)'"
+                                 f":force_original_aspect_ratio=decrease,"
+                                 f"pad={':'.join(video_scale)}:(ow-iw)/2:(oh-ih)/2 [ovrl],"
+                                 f" [0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
 
-            if recipe == Recipe.TEXT:
-                # only text, no more changes
-                self.launch()
-            elif recipe == Recipe.IMAGE:
-                if self.image_scale:
-                    self.launch(source=f"-i {current_file}", filtering=scaled_filter)
-                else:
+                if recipe == Recipe.TEXT:
+                    # only text, no more changes
+                    self.launch()
+                elif recipe == Recipe.IMAGE:
+                    if self.image_scale:
+                        self.launch(source=f"-i {current_file}", filtering=scaled_filter)
+                    else:
+                        self.launch(source=f"-i {current_file}",
+                                    filtering=f"[1:v]scale={':'.join(video_scale)} [ovrl],"
+                                              "[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+                elif recipe == Recipe.CAMERA:
+                    self.launch()
+                elif recipe == Recipe.GIF:
+                    # gif needs ignore_loop flag se that we can set the animation loops
+                    self.launch(source=f"-ignore_loop 0 -i {current_file}",
+                                filtering=f"[1:v]loop=-1, scale={':'.join(video_scale)} [ovrl],"
+                                          f"[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
+                elif recipe == Recipe.VIDEO:
+                    # if not streamed with the original video, fps were too high
                     self.launch(source=f"-i {current_file}",
-                                filtering=f"[1:v]scale={':'.join(video_scale)} [ovrl],"
-                                          "[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
-            elif recipe == Recipe.CAMERA:
-                self.launch()
-            elif recipe == Recipe.GIF:
-                # gif needs ignore_loop flag se that we can set the animation loops            
-                self.launch(source=f"-ignore_loop 0 -i {current_file}",
-                            filtering=f"[1:v]loop=-1, scale={':'.join(video_scale)} [ovrl],"
-                                      f"[0:v][ovrl]overlay=(main_w-overlay_w)/2:(main_h-overlay_h)/2")
-            elif recipe == Recipe.VIDEO:
-                # if not streamed with the original video, fps were too high                
-                self.launch(source=f"-i {current_file}",
-                            filtering=scaled_filter)
+                                filtering=scaled_filter)
+            except Exception as e:  # base64-decoding fails etc
+                print("Cannot process command.", e)
+                continue
 
             sleep(1.2)  # move output from ffmpeg above this process output menu
 
     def parse_query(self, full_uri, temp_file, current_file="", recipe=None, text=None, always_write=False):
         # process URL, path or text
         fontsize = DEFAULT_FONT_SIZE
-        uris = full_uri.strip().split(" ")
+        # if pasting, an "ESC" + "[200~" may be prepended
+        uris = full_uri.strip().lstrip(chr(27) + "[200~").rstrip(chr(27) + "[201~").split(" ")
         first = uris[0]
         if full_uri == "cam" or full_uri == "camera":  # just switch to camera
             print("Restoring camera")
@@ -366,15 +432,8 @@ class Controller:
                 print("Restoring camera (no text found)")
                 recipe = Recipe.CAMERA
             text = None
-        elif not (first.startswith("data:") or first.startswith(("http:", "https:", "//")) or Path(first).exists()):
-            # this is just a text to be displayed
-            text = full_uri.replace(r"\n", "\n").replace("\t", "\n")  # XX might be quoting
-            if text.startswith("*"):
-                fontsize = 200
-                text = text[len("*"):]
-            if not recipe or recipe == Recipe.CAMERA:
-                recipe = Recipe.TEXT
-        else:  # URL, base64 or static file
+        elif first.startswith("data:") or first.startswith(("http:", "https:", "//")) or Path(first).exists():
+            # URL, base64 or static file
             if len(uris) == 1:
                 current_file, recipe = self._prepare_file(temp_file, uris[0], always_write=always_write)
             else:
@@ -391,6 +450,14 @@ class Controller:
                 self.run_program(cmd)
                 gif_output.rename(temp_file)
                 current_file, recipe = temp_file, Recipe.GIF
+        else:
+            # this is just a text to be displayed
+            text = full_uri.replace(r"\n", "\n").replace("\t", "\n")  # XX might be quoting
+            if text.startswith("*"):
+                fontsize = 200
+                text = text[len("*"):]
+            if not recipe or recipe == Recipe.CAMERA:
+                recipe = Recipe.TEXT
         return current_file, recipe, text, fontsize
 
     def _prepare_file(self, temp_file, uri, always_write=False):
@@ -398,7 +465,11 @@ class Controller:
         if uri.startswith("data:"):
             if m := re.search("data:(.*?);base64,(.*)", uri):
                 mimetype, img_string = m.groups()
-                temp_file.write_bytes(b64decode(img_string))
+                try:
+                    temp_file.write_bytes(b64decode(img_string))
+                except binascii.Error:
+                    print("Wrong format of a base64 image")
+                    raise
                 current_file = temp_file
                 recipe = Recipe.get(temp_file, mimetype=mimetype)
             else:
@@ -461,8 +532,16 @@ class Controller:
         filter_cmd = '-filter_complex "' + ",".join(f for f in filter_complex if f) + '"' if any(filter_complex) else ""
         cmd = f"ffmpeg -i {self.dev_input} {source} {filter_cmd} {output_format} {dev_output}"
         print("*** Run:", cmd)
-        output_pipe = None if logger.level <= logging.DEBUG else DEVNULL
-        self.process = Popen(shlex.split(cmd), shell=False, stdin=PIPE, stdout=output_pipe, stderr=output_pipe)
+        # output_pipe = None if logger.level <= logging.DEBUG else DEVNULL # XXX
+        output_pipe = PIPE
+
+        master_fd, slave_fd = pty.openpty()
+        self.process = Popen(shlex.split(cmd), shell=False, stdin=PIPE, stdout=slave_fd, stderr=STDOUT)
+
+        t = Thread(target=self.store_last_line, args=(self.process, master_fd, slave_fd))
+        # XX Should implement this for other processes too.
+        # t.daemon = True <- is that needed? XX
+        t.start()
 
     def clean_up(self, processes=None):
         if not processes:
